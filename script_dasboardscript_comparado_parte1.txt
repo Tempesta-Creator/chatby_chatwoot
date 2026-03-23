@@ -1,0 +1,1532 @@
+<script>
+
+// ============================================================
+// SCRIPT 1: MENU KANBAN + CONEXÕES NO SIDEBAR
+// ============================================================
+
+(function() {
+  'use strict';
+
+  if (window.__chatbyMainScriptsLoaded) return;
+  window.__chatbyMainScriptsLoaded = true;
+
+  // ⚠️ ESTA URL É SUBSTITUÍDA AUTOMATICAMENTE PELO SCRIPT generate-chatwoot-script.sh
+  // Não edite manualmente! Configure no docker-compose.swarm.yml
+  const KANBAN_URL = 'https://kanban.chatby.app.br';
+
+  var panelOpen = false;
+  var menuItemsAdded = false;
+  var lastUrl = location.href;
+  var observer = null;
+
+  // Guarda qual path está aberto no painel (evita clique duplo ao trocar de item)
+  var cwPanelPath = null;
+
+  // ======= Controle de "menu ativo" parecido com o Chatwoot =======
+  var cwPrevActiveEl = null;
+  var cwPrevAria = null;
+  var cwPrevClass = null;
+  var cwPrevInlineStyle = null;
+  var cwPrevActiveLi = null;
+  var cwPrevLiInlineStyle = null;
+  var cwPrevActiveBgEl = null;
+  var cwPrevBgInlineStyle = null;
+  var cwClosingForNativeNavigation = false;
+
+function findChatwootActiveEl() {
+  // 1) padrão mais comum: link com aria-current
+  var a = document.querySelector('aside a[aria-current="page"]');
+  if (a) return a;
+
+  // 2) classes de router (alguns temas)
+  var router = document.querySelector('aside .router-link-exact-active, aside .router-link-active');
+  if (router) return router;
+
+  // 3) fallback: tentar encontrar algum item com aparência de "active" via classes mais comuns do sidebar
+  // (quando o item é <div role="button">)
+  var possible = document.querySelector('aside nav ul li > a.bg-n-alpha-2, aside nav ul li > div.bg-n-alpha-2');
+  if (possible) return possible;
+
+  // 4) último fallback: nada encontrado
+  return null;
+}
+
+var nativeSidebarBridgeBound = false;
+
+function ensureNativeGroupExpanded(groupEl) {
+  if (!groupEl) return;
+  try { groupEl.setAttribute('aria-expanded', 'true'); } catch (e) {}
+  var li = groupEl.closest ? groupEl.closest('li') : null;
+  if (!li) return;
+  var sub = li.querySelector(':scope > ul, ul.sidebar-group-children, ul');
+  if (!sub) return;
+  sub.style.display = '';
+  sub.style.maxHeight = '';
+  sub.style.height = '';
+  sub.style.overflow = '';
+  sub.style.visibility = '';
+  sub.classList.remove('hidden', 'invisible', 'h-0', 'max-h-0', 'overflow-hidden');
+  sub.classList.add('block');
+}
+
+function collapseNativeSidebarGroups() {
+  var groups = document.querySelectorAll('aside nav div[role="button"][aria-expanded], aside nav button[aria-expanded]');
+  groups.forEach(function(group) {
+    if (group.id && group.id.indexOf('cw-custom-menu-') === 0) return;
+    group.setAttribute('aria-expanded', 'false');
+    var li = group.closest ? group.closest('li') : null;
+    if (!li) return;
+    var sub = li.querySelector(':scope > ul, ul.sidebar-group-children, ul');
+    if (!sub) return;
+    sub.classList.add('hidden');
+    sub.classList.remove('block');
+    sub.style.display = '';
+    sub.style.maxHeight = '';
+    sub.style.height = '';
+    sub.style.overflow = '';
+    sub.style.visibility = '';
+  });
+}
+
+function forceCleanupNativeState() {
+  panelOpen = false;
+  cwPanelPath = null;
+  document.body.classList.remove('cw-custom-mode');
+  clearCustomMenuActiveOnly();
+
+  var panel = document.getElementById('cw-custom-panel');
+  var iframe = document.getElementById('cw-iframe');
+  if (panel) panel.classList.remove('visible');
+  if (iframe && iframe.src !== 'about:blank') iframe.src = 'about:blank';
+}
+
+function bindNativeSidebarBridge() {
+  if (nativeSidebarBridgeBound) return;
+  nativeSidebarBridgeBound = true;
+
+  document.addEventListener('click', function(e) {
+    var target = e.target.closest('aside nav a, aside nav div[role="button"], aside nav button');
+    if (!target) return;
+
+    // ignora menus custom
+    if (target.id && target.id.indexOf('cw-custom-menu-') === 0) return;
+
+    // se houver estado custom preso, limpa antes da navegação nativa
+    if (!panelOpen) {
+      forceCleanupNativeState();
+      return;
+    }
+
+    var isNativeGroupButton = target.matches('div[role="button"], button');
+    var isExpandedGroup = isNativeGroupButton && target.getAttribute('aria-expanded') === 'true';
+
+    // Para grupos nativos (expandidos ou não), fecha o custom e reexecuta o clique
+    // no próprio grupo, evitando precisar de 2 cliques para expandir tudo.
+    if (isNativeGroupButton) {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+
+      closeCustomPanelForNativeNavigation();
+      forceCleanupNativeState();
+      var clickedNativeGroup = target;
+      requestAnimationFrame(function() {
+        if (!clickedNativeGroup || !clickedNativeGroup.isConnected) return;
+        // reenviar o clique apenas uma vez e deixar o Chatwoot controlar expansão
+        clickedNativeGroup.dispatchEvent(new MouseEvent('click', {
+          bubbles: true,
+          cancelable: true,
+          view: window
+        }));
+      });
+      return;
+    }
+
+    // para links nativos normais e grupos fechados:
+    // deixa o clique seguir e fecha o custom logo depois
+    setTimeout(function() {
+      if (!panelOpen) {
+        forceCleanupNativeState();
+        return;
+      }
+      closeCustomPanelForNativeNavigation();
+      forceCleanupNativeState();
+    }, 0);
+  }, true);
+}
+
+function isCustomMenuEl(el) {
+  if (!el || !el.id) return false;
+  return el.id.indexOf('cw-custom-menu-') === 0;
+}
+
+function setMenuActiveLikeChatwoot(customEl) {
+  if (!customEl) return;
+
+  // 1) Limpa marcações dos CUSTOMS antes de marcar o novo
+  var customEls = document.querySelectorAll(
+    '#cw-custom-menu-kanban,#cw-custom-menu-conexoes,#cw-custom-menu-chats,#cw-custom-menu-projetos,#cw-custom-menu-permissoes,#cw-custom-menu-chatbot,#cw-custom-menu-permissions'
+  );
+
+  customEls.forEach(function(el) {
+    el.removeAttribute('aria-current');
+    el.classList.remove('router-link-active', 'router-link-exact-active', 'cw-custom-active');
+
+    // remove estilos inline dos customs
+    el.style.backgroundColor = '';
+    el.style.color = '';
+    el.style.fontWeight = '';
+    el.style.borderRadius = '';
+    el.style.boxShadow = '';
+    el.style.outline = '';
+
+    var li = el.closest('li');
+    if (li) li.classList.remove('cw-custom-active-li');
+  });
+
+  // 2) Encontra o item original "ativo"
+  var activeEl = findChatwootActiveEl();
+
+  // 3) Captura o original só uma vez e neutraliza o visual dele (para não ficar 2 ativos)
+  if (!cwPrevActiveEl && activeEl && activeEl !== customEl && !isCustomMenuEl(activeEl)) {
+    cwPrevActiveEl = activeEl;
+    cwPrevAria = activeEl.getAttribute('aria-current');
+    cwPrevClass = activeEl.className;
+
+    // salva o inline style atual do original para restaurar depois
+    cwPrevInlineStyle = activeEl.getAttribute('style');
+
+    // pega o LI do item original ativo (muitos temas pintam o LI, não o A)
+    cwPrevActiveLi = activeEl.closest ? activeEl.closest('li') : null;
+    cwPrevLiInlineStyle = cwPrevActiveLi ? cwPrevActiveLi.getAttribute('style') : null;
+
+    // tenta achar um elemento interno que esteja com fundo (bg-n-alpha-2/hover preso)
+    cwPrevActiveBgEl = null;
+    if (cwPrevActiveLi) {
+      cwPrevActiveBgEl =
+      cwPrevActiveLi.querySelector('a.rounded-lg, div[role="button"].rounded-lg') ||
+      cwPrevActiveLi.querySelector('a[title], div[role="button"][title]') ||
+      null;
+    }
+    cwPrevBgInlineStyle = cwPrevActiveBgEl ? cwPrevActiveBgEl.getAttribute('style') : null;
+
+    // neutraliza o fundo do wrapper interno também (remove o cinza preso)
+    if (cwPrevActiveBgEl) {
+      cwPrevActiveBgEl.style.backgroundColor = 'transparent';
+      cwPrevActiveBgEl.style.boxShadow = 'none';
+    }
+
+    // snapshot do estilo computado do original ativo (para aplicar no custom)
+    try {
+      var cs = window.getComputedStyle(activeEl);
+      window.__cwActiveStyleSnapshot = {
+        backgroundColor: cs.backgroundColor,
+        color: cs.color,
+        fontWeight: cs.fontWeight,
+        borderRadius: cs.borderRadius,
+        boxShadow: cs.boxShadow,
+        outline: cs.outline
+      };
+    } catch (e) {
+      window.__cwActiveStyleSnapshot = null;
+    }
+
+    // tenta desmarcar (pode voltar pelo Vue)
+    activeEl.removeAttribute('aria-current');
+    activeEl.classList.remove('router-link-active', 'router-link-exact-active');
+
+    // ✅ override visual: garante que o original NÃO pareça ativo enquanto o custom está aberto
+    activeEl.style.backgroundColor = 'transparent';
+    activeEl.style.boxShadow = 'none';
+    activeEl.style.fontWeight = '400';
+    activeEl.style.color = 'inherit';
+
+    // ✅ override visual no LI também (remove fundo/realce do original)
+    if (cwPrevActiveLi) {
+     cwPrevActiveLi.style.backgroundColor = 'transparent';
+     cwPrevActiveLi.style.boxShadow = 'none';
+     }
+  }
+
+  // 4) Marca o custom como ativo
+  customEl.setAttribute('aria-current', 'page');
+  customEl.classList.add('router-link-active', 'router-link-exact-active', 'cw-custom-active');
+
+  // 5) Aplica o estilo visual do original ativo no custom
+  try {
+    var snap = window.__cwActiveStyleSnapshot;
+    if (snap) {
+      customEl.style.backgroundColor = snap.backgroundColor;
+      customEl.style.color = snap.color;
+      customEl.style.fontWeight = snap.fontWeight;
+      customEl.style.borderRadius = snap.borderRadius;
+      customEl.style.boxShadow = snap.boxShadow;
+      customEl.style.outline = snap.outline;
+    }
+  } catch (e) {}
+
+  // 6) Marca o LI também (alguns temas aplicam fundo no <li>)
+  var customLi = customEl.closest('li');
+  if (customLi) customLi.classList.add('cw-custom-active-li');
+}
+
+function restoreChatwootActive() {
+
+  // remove marcação dos customs
+  var customActives = document.querySelectorAll(
+    '#cw-custom-menu-kanban[aria-current],#cw-custom-menu-conexoes[aria-current],#cw-custom-menu-chats[aria-current],#cw-custom-menu-projetos[aria-current],#cw-custom-menu-permissoes[aria-current],#cw-custom-menu-chatbot[aria-current],#cw-custom-menu-permissions[aria-current]'
+  );
+
+  customActives.forEach(function(el) {
+    el.removeAttribute('aria-current');
+    el.classList.remove('router-link-active', 'router-link-exact-active', 'cw-custom-active');
+
+    // remove estilos inline aplicados no "ativo" custom
+    el.style.backgroundColor = '';
+    el.style.color = '';
+    el.style.fontWeight = '';
+    el.style.borderRadius = '';
+    el.style.boxShadow = '';
+    el.style.outline = '';
+
+    // se marcou o LI pai como ativo, limpe também
+    var li = el.closest && el.closest('li');
+    if (li) li.classList.remove('cw-custom-active-li');
+  });
+
+  // restaura o original (desfaz override visual)
+  if (cwPrevActiveEl) {
+    // restaura style inline original
+    if (cwPrevInlineStyle !== null && cwPrevInlineStyle !== undefined) {
+      cwPrevActiveEl.setAttribute('style', cwPrevInlineStyle);
+    } else {
+      cwPrevActiveEl.removeAttribute('style');
+    }
+
+    // restaura aria-current e className originais
+    if (cwPrevAria) cwPrevActiveEl.setAttribute('aria-current', cwPrevAria);
+    if (cwPrevClass) cwPrevActiveEl.className = cwPrevClass;
+  }
+
+  // restaura style inline do LI original
+  if (cwPrevActiveLi) {
+    if (cwPrevLiInlineStyle !== null && cwPrevLiInlineStyle !== undefined) {
+      cwPrevActiveLi.setAttribute('style', cwPrevLiInlineStyle);
+    } else {
+    cwPrevActiveLi.removeAttribute('style');
+    }
+  }
+
+  // restaura style do wrapper interno (se existia)
+  if (cwPrevActiveBgEl) {
+  if (cwPrevBgInlineStyle !== null && cwPrevBgInlineStyle !== undefined) {
+    cwPrevActiveBgEl.setAttribute('style', cwPrevBgInlineStyle);
+  } else {
+    cwPrevActiveBgEl.removeAttribute('style');
+  }
+  }
+
+  // limpa estado salvo
+  cwPrevActiveEl = null;
+  cwPrevAria = null;
+  cwPrevClass = null;
+  cwPrevInlineStyle = null;
+  cwPrevActiveLi = null;
+  cwPrevLiInlineStyle = null;
+  cwPrevActiveBgEl = null;
+  cwPrevBgInlineStyle = null;
+}
+
+function clearCustomMenuActiveOnly() {
+  var customEls = document.querySelectorAll(
+    '#cw-custom-menu-kanban,' +
+    '#cw-custom-menu-conexoes,' +
+    '#cw-custom-menu-chats,' +
+    '#cw-custom-menu-projetos,' +
+    '#cw-custom-menu-permissoes,' +
+    '#cw-custom-menu-chatbot,' +
+    '#cw-custom-menu-permissions'
+  );
+
+  customEls.forEach(function(el) {
+    // remove atributos/classes de "ativo"
+    el.removeAttribute('aria-current');
+    el.classList.remove(
+      'cw-custom-active',
+      'active',
+      'router-link-active',
+      'router-link-exact-active'
+    );
+
+    // limpa qualquer resto visual inline
+    el.style.backgroundColor = '';
+    el.style.color = '';
+    el.style.fontWeight = '';
+    el.style.borderRadius = '';
+    el.style.boxShadow = '';
+    el.style.outline = '';
+
+    // limpa o LI pai, se você estiver usando classe nele
+    var li = el.closest && el.closest('li');
+    if (li) {
+      li.classList.remove('cw-custom-active-li', 'active');
+      li.style.backgroundColor = '';
+      li.style.boxShadow = '';
+    }
+  });
+
+  // limpa estados salvos, sem restaurar nativo anterior
+  cwPrevActiveEl = null;
+  cwPrevAria = null;
+  cwPrevClass = null;
+  cwPrevInlineStyle = null;
+  cwPrevActiveLi = null;
+  cwPrevLiInlineStyle = null;
+  cwPrevActiveBgEl = null;
+  cwPrevBgInlineStyle = null;
+}
+
+function closeCustomPanelForNativeNavigation() {
+  panelOpen = false;
+  cwPanelPath = null;
+
+  // sai do modo custom
+  document.body.classList.remove('cw-custom-mode');
+
+  // limpa TODO o ativo visual dos custom
+  clearCustomMenuActiveOnly();
+
+  var panel = document.getElementById('cw-custom-panel');
+  var iframe = document.getElementById('cw-iframe');
+
+  if (panel) panel.classList.remove('visible');
+  if (iframe) iframe.src = 'about:blank';
+}
+
+// ======= Abre / troca rota no iframe sem precisar 2 cliques =======
+  function openOrSwitch(path) {
+    path = path || '';
+
+    // Se já está aberto no mesmo path => fecha (toggle real)
+   if (panelOpen && cwPanelPath === path) {
+     return; // não fecha, igual menu original
+   }
+
+    // Se está aberto em outro path => apenas troca
+    cwPanelPath = path;
+    window.cwCustomOpen(path);
+  }
+
+function injectCSS() {
+  if (document.getElementById('cw-custom-css')) return;
+  var css = document.createElement('style');
+  css.id = 'cw-custom-css';
+
+  css.textContent = '#cw-custom-menu-kanban,#cw-custom-menu-conexoes,#cw-custom-menu-chats,#cw-custom-menu-projetos,#cw-custom-menu-permissoes,#cw-custom-menu-chatbot,#cw-custom-menu-permissions{margin-top:0 !important;margin-bottom:0 !important}#cw-custom-menu-kanban .menu-icon,#cw-custom-menu-conexoes .menu-icon,#cw-custom-menu-chats .menu-icon,#cw-custom-menu-projetos .menu-icon,#cw-custom-menu-permissoes .menu-icon,#cw-custom-menu-chatbot .menu-icon,#cw-custom-menu-permissions .menu-icon{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}#cw-custom-menu-kanban .menu-icon svg,#cw-custom-menu-conexoes .menu-icon svg,#cw-custom-menu-chats .menu-icon svg,#cw-custom-menu-projetos .menu-icon svg,#cw-custom-menu-permissoes .menu-icon svg,#cw-custom-menu-chatbot .menu-icon svg,#cw-custom-menu-permissions .menu-icon svg{width:16px;height:16px}#cw-custom-panel{position:fixed;top:0;right:0;bottom:0;background:#fff;z-index:100;display:none;flex-direction:column}#cw-custom-panel.visible{display:flex}#cw-custom-panel .panel-body{flex:1;position:relative;background:#fff;overflow:hidden}#cw-custom-panel iframe{width:100%;height:100%;border:none;display:block}#cw-custom-panel .loading-overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#fff;z-index:10}#cw-custom-panel .loading-overlay.hidden{display:none}#cw-custom-panel .spinner{width:48px;height:48px;border:4px solid #e0e0e0;border-top-color:#1f93ff;border-radius:50%;animation:cwSpin .8s linear infinite}@keyframes cwSpin{to{transform:rotate(360deg)}}#cw-custom-panel .loading-text{margin-top:16px;color:#6e84a3;font-size:14px}#cw-custom-panel .error-overlay{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;background:#fff;text-align:center;padding:40px;z-index:10}#cw-custom-panel .error-overlay.visible{display:flex}#cw-custom-panel .error-icon{font-size:64px;margin-bottom:20px}#cw-custom-panel .error-title{font-size:20px;font-weight:600;color:#1f2d3d;margin:0 0 10px}#cw-custom-panel .error-text{color:#6e84a3;margin:0 0 24px;max-width:400px;line-height:1.5}#cw-custom-panel .error-btn{padding:12px 24px;background:#1f93ff;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:all .2s}#cw-custom-panel .error-btn:hover{background:#1976d2}';
+
+  //ADICIONE ESTE BLOCO
+  css.textContent += '.cw-custom-active-li > a, a.cw-custom-active{font-weight:600 !important;}';
+  
+  document.head.appendChild(css);
+}
+
+  function getSidebarWidth() {
+    var aside = document.querySelector('aside.bg-n-solid-2, aside[class*="bg-n-solid"], aside.border-r, aside');
+    if (aside) {
+      return aside.getBoundingClientRect().right;
+    }
+    return 200;
+  }
+
+  function createPanel() {
+    if (document.getElementById('cw-custom-panel')) return;
+    var panel = document.createElement('div');
+    panel.id = 'cw-custom-panel';
+    panel.innerHTML = '<div class="panel-body"><div class="loading-overlay" id="cw-loading"><div class="spinner"></div><p class="loading-text">Carregando...</p></div><div class="error-overlay" id="cw-error"><div class="error-icon">🔒</div><h3 class="error-title">Site Protegido</h3><p class="error-text">Este site possui proteções que impedem a exibição incorporada.</p><button class="error-btn" onclick="window.cwCustomExternal()">↗️ Abrir em Nova Aba</button></div><iframe id="cw-iframe" src="about:blank" allow="microphone; camera"></iframe></div>';
+    document.body.appendChild(panel);
+
+    // Adiciona listener para enviar tema quando iframe carregar
+    var iframe = document.getElementById('cw-iframe');
+    if (iframe) {
+      iframe.addEventListener('load', function() {
+        // Aguarda um pouco para garantir que o iframe está pronto
+        setTimeout(function() {
+          var theme = detectChatwootTheme();
+          console.log('[CW Theme] Enviando tema para iframe após load:', theme);
+          iframe.contentWindow.postMessage({
+            action: 'setTheme',
+            theme: theme
+          }, '*');
+        }, 100);
+      });
+    }
+  }
+
+  // Escuta mensagens do iframe para fechar o painel
+  window.addEventListener('message', function(event) {
+    // Verifica se a mensagem vem do KanbanCW
+    if (event.data && event.data.action === 'closePanel') {
+      console.log('[CW Menu] Recebeu mensagem para fechar painel');
+      window.cwCustomClose();
+    }
+  });
+
+    // ============================================================
+  // WIDGET FLUTUANTE DE CHAMADA WAVOIP
+  // ============================================================
+
+  var wavoipWidgetTimer = null;
+  var wavoipWidgetSeconds = 0;
+  var wavoipWidgetMuted = false;
+
+  function createWavoipCallWidget() {
+    if (document.getElementById('cw-wavoip-call-widget')) return;
+    var widget = document.createElement('div');
+    widget.id = 'cw-wavoip-call-widget';
+    widget.innerHTML =
+      '<div class="wavoip-pulse"></div>' +
+      '<div class="wavoip-info">' +
+        '<div class="wavoip-name" id="cw-wavoip-name">Ligando...</div>' +
+        '<div class="wavoip-sub" id="cw-wavoip-sub">00:00</div>' +
+      '</div>' +
+      '<div class="wavoip-actions">' +
+        '<button class="wavoip-btn wavoip-btn-mute" id="cw-wavoip-mute-btn" title="Mudo" onclick="window.cwWavoipToggleMute()">' +
+          '<svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"/></svg>' +
+        '</button>' +
+        '<button class="wavoip-btn wavoip-btn-end" title="Encerrar" onclick="window.cwWavoipEndCall()">' +
+          '<svg fill="currentColor" viewBox="0 0 24 24"><path d="M6.6 10.8c1.4 2.8 3.8 5.1 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1-9.4 0-17-7.6-17-17 0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.3.2 2.5.6 3.6.1.3 0 .7-.2 1L6.6 10.8z" transform="rotate(135 12 12)"/></svg>' +
+        '</button>' +
+      '</div>';
+    document.body.appendChild(widget);
+  }
+
+  function formatWavoipTime(s) {
+    var m = Math.floor(s / 60);
+    var sec = s % 60;
+    return (m < 10 ? '0' : '') + m + ':' + (sec < 10 ? '0' : '') + sec;
+  }
+
+  window.cwWavoipShowCallWidget = function(contactName, phone) {
+    createWavoipCallWidget();
+    wavoipWidgetSeconds = 0;
+    wavoipWidgetMuted = false;
+    var nameEl = document.getElementById('cw-wavoip-name');
+    var subEl = document.getElementById('cw-wavoip-sub');
+    var muteBtn = document.getElementById('cw-wavoip-mute-btn');
+    if (nameEl) nameEl.textContent = contactName || phone || 'Ligando...';
+    if (subEl) subEl.textContent = phone ? phone + ' · 00:00' : '00:00';
+    if (muteBtn) muteBtn.classList.remove('muted');
+    var widget = document.getElementById('cw-wavoip-call-widget');
+    if (widget) widget.classList.add('visible');
+    if (wavoipWidgetTimer) clearInterval(wavoipWidgetTimer);
+    wavoipWidgetTimer = setInterval(function() {
+      wavoipWidgetSeconds++;
+      var sub = document.getElementById('cw-wavoip-sub');
+      if (sub) sub.textContent = (phone ? phone + ' · ' : '') + formatWavoipTime(wavoipWidgetSeconds);
+    }, 1000);
+  };
+
+  window.cwWavoipHideCallWidget = function() {
+    if (wavoipWidgetTimer) { clearInterval(wavoipWidgetTimer); wavoipWidgetTimer = null; }
+    wavoipWidgetSeconds = 0;
+    wavoipWidgetMuted = false;
+    var widget = document.getElementById('cw-wavoip-call-widget');
+    if (widget) widget.classList.remove('visible');
+  };
+
+  window.cwWavoipShowError = function(msg) {
+    var id = 'cw-wavoip-error-toast';
+    var existing = document.getElementById(id);
+    if (existing) existing.remove();
+    var toast = document.createElement('div');
+    toast.id = id;
+    toast.textContent = '📵 ' + msg;
+    toast.style.cssText = 'position:fixed;top:16px;right:24px;z-index:99999;background:#ef4444;color:#fff;font-size:13px;font-weight:500;padding:10px 16px;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.3);max-width:320px;animation:cwWavoipSlideIn .3s ease';
+    document.body.appendChild(toast);
+    setTimeout(function() { if (toast.parentNode) toast.remove(); }, 5000);
+  };
+
+  window.cwWavoipToggleMute = function() {
+    var iframe = document.getElementById('cw-iframe');
+    if (iframe && iframe.contentWindow) {
+      iframe.contentWindow.postMessage({ type: 'WAVOIP_TOGGLE_MUTE' }, '*');
+    }
+  };
+
+  window.cwWavoipEndCall = function() {
+    var iframe = document.getElementById('cw-iframe');
+    if (iframe && iframe.contentWindow) {
+      iframe.contentWindow.postMessage({ type: 'WAVOIP_END_CALL' }, '*');
+    }
+    window.cwWavoipHideCallWidget();
+  };
+
+  // ============================================================
+  // WIDGET FLUTUANTE DE CHAMADA ENTRANTE WAVOIP
+  // ============================================================
+
+  function createWavoipIncomingWidget() {
+    if (document.getElementById('cw-wavoip-incoming-widget')) return;
+    var widget = document.createElement('div');
+    widget.id = 'cw-wavoip-incoming-widget';
+    widget.innerHTML =
+      '<div class="wavoip-incoming-icon">' +
+        '<svg fill="#22c55e" viewBox="0 0 24 24"><path d="M6.6 10.8c1.4 2.8 3.8 5.1 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1-9.4 0-17-7.6-17-17 0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.3.2 2.5.6 3.6.1.3 0 .7-.2 1L6.6 10.8z"/></svg>' +
+      '</div>' +
+      '<div class="wavoip-info">' +
+        '<div class="wavoip-name" id="cw-wavoip-incoming-name">Chamada entrante</div>' +
+        '<div class="wavoip-sub" id="cw-wavoip-incoming-sub">WhatsApp</div>' +
+      '</div>' +
+      '<div class="wavoip-actions">' +
+        '<button class="wavoip-btn wavoip-btn-reject" title="Rejeitar" onclick="window.cwWavoipRejectCall()">' +
+          '<svg fill="currentColor" viewBox="0 0 24 24"><path d="M6.6 10.8c1.4 2.8 3.8 5.1 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1-9.4 0-17-7.6-17-17 0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.3.2 2.5.6 3.6.1.3 0 .7-.2 1L6.6 10.8z" transform="rotate(135 12 12)"/></svg>' +
+        '</button>' +
+        '<button class="wavoip-btn wavoip-btn-accept" title="Atender" onclick="window.cwWavoipAcceptCall()">' +
+          '<svg fill="currentColor" viewBox="0 0 24 24"><path d="M6.6 10.8c1.4 2.8 3.8 5.1 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1-9.4 0-17-7.6-17-17 0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.3.2 2.5.6 3.6.1.3 0 .7-.2 1L6.6 10.8z"/></svg>' +
+        '</button>' +
+      '</div>';
+    document.body.appendChild(widget);
+  }
+
+  window.cwWavoipShowIncomingWidget = function(displayName, phone) {
+    createWavoipIncomingWidget();
+    var nameEl = document.getElementById('cw-wavoip-incoming-name');
+    var subEl = document.getElementById('cw-wavoip-incoming-sub');
+    if (nameEl) nameEl.textContent = displayName || phone || 'Número desconhecido';
+    if (subEl) subEl.textContent = (phone && displayName && phone !== displayName) ? phone : 'WhatsApp';
+    var widget = document.getElementById('cw-wavoip-incoming-widget');
+    if (widget) widget.classList.add('visible');
+  };
+
+  window.cwWavoipHideIncomingWidget = function() {
+    var widget = document.getElementById('cw-wavoip-incoming-widget');
+    if (widget) widget.classList.remove('visible');
+  };
+
+  window.cwWavoipAcceptCall = function() {
+    var iframe = document.getElementById('cw-iframe');
+    if (iframe && iframe.contentWindow) {
+      iframe.contentWindow.postMessage({ type: 'WAVOIP_ACCEPT_CALL' }, '*');
+    }
+    window.cwWavoipHideIncomingWidget();
+  };
+
+  window.cwWavoipRejectCall = function() {
+    var iframe = document.getElementById('cw-iframe');
+    if (iframe && iframe.contentWindow) {
+      iframe.contentWindow.postMessage({ type: 'WAVOIP_REJECT_CALL' }, '*');
+    }
+    window.cwWavoipHideIncomingWidget();
+  };
+
+  // Escuta mensagens do iframe para fechar o painel e controlar widget Wavoip
+  window.addEventListener('message', function(event) {
+    // Verifica se a mensagem vem do KanbanCW
+    if (event.data && event.data.action === 'closePanel') {
+      console.log('[CW Menu] Recebeu mensagem para fechar painel');
+      window.cwCustomClose();
+    }
+    if (event.data && event.data.type === 'WAVOIP_CALL_STARTED') {
+      console.log('[Wavoip Widget] Chamada iniciada — exibindo widget');
+      window._cwWavoipCalling = false;
+      window.cwWavoipShowCallWidget(event.data.contactName || event.data.phone, event.data.phone);
+    }
+    if (event.data && event.data.type === 'WAVOIP_CALL_FAILED') {
+      console.log('[Wavoip Widget] Chamada falhou:', event.data.message);
+      window._cwWavoipCalling = false;
+      window.cwWavoipShowError(event.data.message || 'Não foi possível realizar a chamada');
+    }
+    if (event.data && event.data.type === 'WAVOIP_CALL_ENDED') {
+      console.log('[Wavoip Widget] Chamada encerrada — ocultando widget');
+      window.cwWavoipHideCallWidget();
+    }
+    if (event.data && event.data.type === 'WAVOIP_MUTED') {
+      wavoipWidgetMuted = event.data.isMuted;
+      var muteBtn = document.getElementById('cw-wavoip-mute-btn');
+      if (muteBtn) {
+        if (wavoipWidgetMuted) {
+          muteBtn.classList.add('muted');
+          muteBtn.title = 'Ativar microfone';
+        } else {
+          muteBtn.classList.remove('muted');
+          muteBtn.title = 'Silenciar';
+        }
+      }
+    }
+    if (event.data && event.data.type === 'WAVOIP_INCOMING_CALL') {
+      console.log('[Wavoip Widget] Chamada entrante — exibindo widget', event.data.phone);
+      window.cwWavoipShowIncomingWidget(event.data.displayName || event.data.phone, event.data.phone);
+    }
+    if (event.data && event.data.type === 'WAVOIP_INCOMING_CALL_ENDED') {
+      console.log('[Wavoip Widget] Chamada entrante encerrada — ocultando widget');
+      window.cwWavoipHideIncomingWidget();
+    }
+  });
+
+
+  // ============================================================
+  // DETECÇÃO AUTOMÁTICA DE TEMA (DARK/LIGHT MODE)
+  // ============================================================
+
+  function detectChatwootTheme() {
+    // Chatwoot adiciona classe 'dark' no body quando está em dark mode
+    return document.body.classList.contains('dark') ? 'dark' : 'light';
+  }
+
+  function applyThemeToPanel() {
+    var panel = document.getElementById('cw-custom-panel');
+    if (!panel) return;
+
+    var theme = detectChatwootTheme();
+    var isDark = theme === 'dark';
+
+    console.log('[CW Theme] Aplicando tema:', theme);
+
+    // Aplica tema no painel
+    if (isDark) {
+      panel.classList.add('dark-mode');
+      panel.style.background = '#1f2937';
+
+      // Atualiza loading overlay
+      var loading = panel.querySelector('.loading-overlay');
+      if (loading) {
+        loading.style.background = '#1f2937';
+        loading.style.color = '#e5e7eb';
+      }
+
+      var loadingText = panel.querySelector('.loading-text');
+      if (loadingText) {
+        loadingText.style.color = '#9ca3af';
+      }
+
+      // Atualiza error overlay
+      var error = panel.querySelector('.error-overlay');
+      if (error) {
+        error.style.background = '#1f2937';
+      }
+
+      var errorTitle = panel.querySelector('.error-title');
+      if (errorTitle) {
+        errorTitle.style.color = '#f3f4f6';
+      }
+
+      var errorText = panel.querySelector('.error-text');
+      if (errorText) {
+        errorText.style.color = '#9ca3af';
+      }
+    } else {
+      panel.classList.remove('dark-mode');
+      panel.style.background = '#fff';
+
+      var loading = panel.querySelector('.loading-overlay');
+      if (loading) {
+        loading.style.background = '#fff';
+        loading.style.color = '#1f2d3d';
+      }
+
+      var loadingText = panel.querySelector('.loading-text');
+      if (loadingText) {
+        loadingText.style.color = '#6e84a3';
+      }
+
+      var error = panel.querySelector('.error-overlay');
+      if (error) {
+        error.style.background = '#fff';
+      }
+
+      var errorTitle = panel.querySelector('.error-title');
+      if (errorTitle) {
+        errorTitle.style.color = '#1f2d3d';
+      }
+
+      var errorText = panel.querySelector('.error-text');
+      if (errorText) {
+        errorText.style.color = '#6e84a3';
+      }
+    }
+
+    // Envia mensagem para o iframe para aplicar tema também
+    var iframe = document.getElementById('cw-iframe');
+    if (iframe && iframe.contentWindow) {
+      iframe.contentWindow.postMessage({
+        action: 'setTheme',
+        theme: theme
+      }, '*');
+    }
+  }
+
+  // Observa mudanças de tema no Chatwoot
+  var themeObserver = new MutationObserver(function(mutations) {
+    mutations.forEach(function(mutation) {
+      if (mutation.type === 'attributes' && mutation.attributeName === 'class') {
+        console.log('[CW Theme] Tema do Chatwoot mudou');
+        applyThemeToPanel();
+      }
+    });
+  });
+
+  // Inicia observação do body para detectar mudanças de tema
+  function startThemeObserver() {
+    themeObserver.observe(document.body, {
+      attributes: true,
+      attributeFilter: ['class']
+    });
+    console.log('[CW Theme] Observer iniciado');
+  }
+
+  // Aplica tema inicial
+  setTimeout(function() {
+    applyThemeToPanel();
+    startThemeObserver();
+  }, 1000);
+
+  function getAuthFromCookie() {
+    var cookies = document.cookie.split(';');
+    for (var i = 0; i < cookies.length; i++) {
+      var cookie = cookies[i].trim();
+      if (cookie.indexOf('cw_d_session_info=') === 0) {
+        try {
+          var value = cookie.substring('cw_d_session_info='.length);
+          var parsed = JSON.parse(decodeURIComponent(value));
+          if (parsed['access-token'] && parsed['client'] && parsed['uid']) {
+            return parsed;
+          }
+        } catch (e) {
+          console.log('[CW Menu] Erro ao parsear cookie:', e);
+        }
+      }
+    }
+    return null;
+  }
+
+  window.cwCustomOpen = function(path) {
+  path = path || '';
+  panelOpen = true;
+  cwPanelPath = path; // suficiente, sem repetir "|| ''"
+  var panel = document.getElementById('cw-custom-panel');
+  var iframe = document.getElementById('cw-iframe');
+  var loading = document.getElementById('cw-loading');
+  var error = document.getElementById('cw-error');
+  var kanbanItem = document.getElementById('cw-custom-menu-kanban');
+  var conexoesItem = document.getElementById('cw-custom-menu-conexoes');
+  var chatsItem = document.getElementById('cw-custom-menu-chats');
+  var projetosItem = document.getElementById('cw-custom-menu-projetos');
+  var permissoesItem = document.getElementById('cw-custom-menu-permissoes');
+  var chatbotItem = document.getElementById('cw-custom-menu-chatbot');
+  var permissionsItem = document.getElementById('cw-custom-menu-permissions');
+
+  panel.style.left = getSidebarWidth() + 'px';
+  loading.classList.remove('hidden');
+  error.classList.remove('visible');
+  iframe.src = KANBAN_URL + path;
+  panel.classList.add('visible');
+  document.body.classList.add('cw-custom-mode');
+  bindNativeSidebarBridge();
+
+  // Aplica tema do Chatwoot ao painel
+  applyThemeToPanel();
+
+  // Remove 'active' de todos os itens primeiro
+  if (kanbanItem) kanbanItem.classList.remove('active');
+  if (conexoesItem) conexoesItem.classList.remove('active');
+  if (chatsItem) chatsItem.classList.remove('active');
+  if (projetosItem) projetosItem.classList.remove('active');
+  if (permissoesItem) permissoesItem.classList.remove('active');
+  if (chatbotItem) chatbotItem.classList.remove('active');
+  if (permissionsItem) permissionsItem.classList.remove('active');
+
+  // Adiciona 'active' apenas no item correto
+  var selected = null;
+
+  if (path === '/conexoes' && conexoesItem) {
+    conexoesItem.classList.add('active');
+    selected = conexoesItem;
+  } else if (path === '/chats' && chatsItem) {
+    chatsItem.classList.add('active');
+    selected = chatsItem;
+  } else if (path === '/projects' && projetosItem) {
+    projetosItem.classList.add('active');
+    selected = projetosItem;
+  } else if (path === '/permissions' && permissoesItem) {
+    permissoesItem.classList.add('active');
+    selected = permissoesItem;
+  } else if (path === '/chatbot' && chatbotItem) {
+    chatbotItem.classList.add('active');
+    selected = chatbotItem;
+  } else if (path === '/admin/permissions' && permissionsItem) {
+    permissionsItem.classList.add('active');
+    selected = permissionsItem;
+  } else if (kanbanItem) {
+    kanbanItem.classList.add('active');
+    selected = kanbanItem;
+  }
+
+  // Marca o custom como "ativo" igual o sidebar do Chatwoot
+  setMenuActiveLikeChatwoot(selected);
+
+  // RECOLOQUE ISTO (era do seu original)
+  iframe.onload = function() {
+    loading.classList.add('hidden');
+    var auth = getAuthFromCookie();
+    if (auth && iframe.contentWindow) {
+      console.log('[CW Menu] Enviando token para iframe...');
+      iframe.contentWindow.postMessage({
+        type: 'AUTH_TOKEN',
+        payload: auth
+      }, '*');
+    }
+  };
+
+  // RECOLOQUE ISTO (era do seu original)
+  setTimeout(function() {
+    if (!loading.classList.contains('hidden')) {
+      loading.classList.add('hidden');
+      error.classList.add('visible');
+    }
+  }, 8000);
+};
+
+  window.cwCustomClose = function() {
+    panelOpen = false;
+cwPanelPath = null;
+document.body.classList.remove('cw-custom-mode');
+
+clearCustomMenuActiveOnly();
+cwClosingForNativeNavigation = false;
+
+    var panel = document.getElementById('cw-custom-panel');
+    var iframe = document.getElementById('cw-iframe');
+    var kanbanItem = document.getElementById('cw-custom-menu-kanban');
+    var conexoesItem = document.getElementById('cw-custom-menu-conexoes');
+    var chatsItem = document.getElementById('cw-custom-menu-chats');
+    var projetosItem = document.getElementById('cw-custom-menu-projetos');
+    var permissoesItem = document.getElementById('cw-custom-menu-permissoes');
+    var chatbotItem = document.getElementById('cw-custom-menu-chatbot');
+    var permissionsItem = document.getElementById('cw-custom-menu-permissions');
+
+    panel.classList.remove('visible');
+    iframe.src = 'about:blank';
+    if (kanbanItem) kanbanItem.classList.remove('active');
+    if (conexoesItem) conexoesItem.classList.remove('active');
+    if (chatsItem) chatsItem.classList.remove('active');
+    if (projetosItem) projetosItem.classList.remove('active');
+    if (permissoesItem) permissoesItem.classList.remove('active');
+    if (chatbotItem) chatbotItem.classList.remove('active');
+    if (permissionsItem) permissionsItem.classList.remove('active');
+  };
+
+  window.cwCustomExternal = function() { window.open(KANBAN_URL, '_blank'); };
+  window.cwCustomToggleKanban = function() { openOrSwitch(''); };
+  window.cwCustomToggleConexoes = function() { openOrSwitch('/conexoes'); };
+  window.cwCustomToggleChats = function() { openOrSwitch('/chats'); };
+  window.cwCustomToggleProjetos = function() { openOrSwitch('/projects'); };
+  window.cwCustomTogglePermissoes = function() { openOrSwitch('/permissions'); };
+  window.cwCustomTogglePermissions = function() { openOrSwitch('/admin/permissions'); };
+  window.cwCustomToggleChatbot = function() { openOrSwitch('/chatbot'); };
+
+  function closeOnNavigation() {
+    if (panelOpen && location.href !== lastUrl) {
+      window.cwCustomClose();
+    }
+    lastUrl = location.href;
+  }
+
+  function setupNavigationDetection() {
+    window.addEventListener('popstate', closeOnNavigation);
+    var origPush = history.pushState;
+    var origReplace = history.replaceState;
+    history.pushState = function() { origPush.apply(this, arguments); closeOnNavigation(); };
+    history.replaceState = function() { origReplace.apply(this, arguments); closeOnNavigation(); };
+    document.addEventListener('click', function(e) {
+      if (!panelOpen) return;
+      var link = e.target.closest('a');
+      if (link && !link.closest('#cw-custom-panel')) {
+        setTimeout(closeOnNavigation, 100);
+      }
+    }, true);
+  }
+
+  async function checkIfSuperAdmin() {
+    var authHeaders = getAuthFromCookie();
+    if (!authHeaders) {
+      console.log('[CW Menu] Sem authHeaders, não é SuperAdmin');
+      return false;
+    }
+
+    try {
+      // Usa URL relativa pois o script já está rodando no Chatwoot
+      var res = await fetch('/api/v1/profile', {
+        headers: {
+          'access-token': authHeaders['access-token'],
+          'token-type': authHeaders['token-type'] || 'Bearer',
+          'client': authHeaders['client'],
+          'expiry': authHeaders['expiry'] || '',
+          'uid': authHeaders['uid']
+        }
+      });
+
+      if (!res.ok) {
+        console.log('[CW Menu] Erro na resposta do profile:', res.status);
+        return false;
+      }
+      var data = await res.json();
+      console.log('[CW Menu] Profile type:', data.type);
+      return data.type === 'SuperAdmin';
+    } catch (err) {
+      console.log('[CW Menu] Erro ao verificar SuperAdmin:', err);
+      return false;
+    }
+  }
+
+  async function checkIfAccountAdmin() {
+    var authHeaders = getAuthFromCookie();
+    if (!authHeaders) {
+      return false;
+    }
+
+    try {
+      var res = await fetch('/api/v1/profile', {
+        headers: {
+          'access-token': authHeaders['access-token'],
+          'token-type': authHeaders['token-type'] || 'Bearer',
+          'client': authHeaders['client'],
+          'expiry': authHeaders['expiry'] || '',
+          'uid': authHeaders['uid']
+        }
+      });
+
+      if (!res.ok) {
+        return false;
+      }
+      var data = await res.json();
+      console.log('[CW Menu] User role:', data.role);
+      return data.role === 'administrator';
+    } catch (err) {
+      console.log('[CW Menu] Erro ao verificar role:', err);
+      return false;
+    }
+  }
+
+  async function checkEnabledFeatures() {
+    var authHeaders = getAuthFromCookie();
+    if (!authHeaders) {
+      console.log('[CW Menu] Sem authHeaders, retornando features desabilitadas');
+      return { kanbanEnabled: false, chatsInternosEnabled: false, conexoesEnabled: false, projectsEnabled: false, chatbotFlowsEnabled: false };
+    }
+
+    try {
+      // Busca features habilitadas no backend KanbanCW
+      var res = await fetch(KANBAN_URL + '/api/features', {
+        headers: {
+          'access-token': authHeaders['access-token'],
+          'token-type': authHeaders['token-type'] || 'Bearer',
+          'client': authHeaders['client'],
+          'expiry': authHeaders['expiry'] || '',
+          'uid': authHeaders['uid']
+        }
+      });
+
+      if (!res.ok) {
+        console.log('[CW Menu] Erro ao buscar features:', res.status);
+        // Em caso de erro, habilita tudo (fail-open)
+        return { kanbanEnabled: true, chatsInternosEnabled: true, conexoesEnabled: true };
+      }
+
+      var result = await res.json();
+      var features = result.data || {};
+      console.log('[CW Menu] Features habilitadas:', features);
+      return {
+        kanbanEnabled: features.kanbanEnabled !== false,
+        chatsInternosEnabled: features.chatsInternosEnabled !== false,
+        conexoesEnabled: features.conexoesEnabled !== false,
+        projectsEnabled: features.projectsEnabled !== false,
+        chatbotFlowsEnabled: features.chatbotFlowsEnabled !== false
+      };
+    } catch (err) {
+      console.log('[CW Menu] Erro ao verificar features:', err);
+      // Em caso de erro, habilita tudo (fail-open)
+      return { kanbanEnabled: true, chatsInternosEnabled: true, conexoesEnabled: true, projectsEnabled: true, chatbotFlowsEnabled: true };
+    }
+  }
+
+  async function checkUserPermissions() {
+    try {
+      var authHeaders = getAuthFromCookie();
+      if (!authHeaders || !authHeaders['access-token']) {
+        console.log('[CW Menu] Sem headers de auth, usando permissões padrão');
+        return {
+          kanbanAccess: true,
+          conexoesAccess: true,
+          chatsInternosAccess: true,
+          projectsAccess: true,
+          chatbotFlowsAccess: true,
+          permissoesAccess: false
+        };
+      }
+
+      var res = await fetch(KANBAN_URL + '/api/permissions/me', {
+        headers: {
+          'access-token': authHeaders['access-token'],
+          'token-type': authHeaders['token-type'] || 'Bearer',
+          'client': authHeaders['client'],
+          'expiry': authHeaders['expiry'] || '',
+          'uid': authHeaders['uid']
+        }
+      });
+
+      if (!res.ok) {
+        console.log('[CW Menu] Erro ao buscar permissões do usuário:', res.status);
+        // Em caso de erro, habilita tudo (fail-open)
+        return {
+          kanbanAccess: true,
+          conexoesAccess: true,
+          chatsInternosAccess: true,
+          projectsAccess: true,
+          chatbotFlowsAccess: true,
+          permissoesAccess: false
+        };
+      }
+
+      var result = await res.json();
+      var permissions = result.data || {};
+      console.log('[CW Menu] Permissões do usuário:', permissions);
+      return {
+        kanbanAccess: permissions.kanbanAccess !== false,
+        conexoesAccess: permissions.conexoesAccess !== false,
+        chatsInternosAccess: permissions.chatsInternosAccess !== false,
+        projectsAccess: permissions.projectsAccess !== false,
+        chatbotFlowsAccess: permissions.chatbotFlowsAccess !== false,
+        permissoesAccess: permissions.permissoesAccess === true
+      };
+    } catch (err) {
+      console.log('[CW Menu] Erro ao verificar permissões:', err);
+      // Em caso de erro, habilita tudo (fail-open)
+      return {
+        kanbanAccess: true,
+        conexoesAccess: true,
+        chatsInternosAccess: true,
+        projectsAccess: true,
+        chatbotFlowsAccess: true,
+        permissoesAccess: false
+      };
+    }
+  }
+
+  async function addMenuItems() {
+  if (menuItemsAdded) return true;
+
+  var mainNav = document.querySelector('aside nav ul.list-none, aside nav > ul, nav.grid ul');
+  if (!mainNav) {
+    console.log('[CW Menu] Não encontrou ul do menu principal');
+    return false;
+  }
+
+  var allLi = mainNav.querySelectorAll(':scope > li');
+  if (allLi.length === 0) {
+    console.log('[CW Menu] Não encontrou itens li no menu');
+    return false;
+  }
+
+  var refLi = null;
+  var refLink = null;
+  var configLi = null;
+
+  for (var i = 0; i < allLi.length; i++) {
+    var text = (allLi[i].textContent || '').toLowerCase();
+
+    if (text.includes('configurações') || text.includes('settings')) {
+      configLi = allLi[i];
+    }
+
+    if (text.includes('relatório') || text.includes('report') || text.includes('campanha') || text.includes('campaign')) {
+      refLi = allLi[i];
+      refLink = refLi.querySelector('a, div[role="button"]');
+      break;
+    }
+  }
+
+  if (!refLi) {
+    refLi = allLi[allLi.length - 1];
+    refLink = refLi.querySelector('a, div[role="button"]');
+  }
+
+  if (!refLi || !refLink) {
+    console.log('[CW Menu] Não encontrou item de referência');
+    return false;
+  }
+
+  // Helper: cria o <li> + <a> do menu custom com mesmo padrão visual
+  function createCustomMenuLi(opts) {
+    var li = document.createElement('li');
+    li.className = refLi.className;
+
+    var a = document.createElement('a');
+    a.id = opts.id;
+    a.className = refLink.className;
+    a.href = '#';
+    a.style.cursor = 'pointer';
+
+    // Importante: manter HTML igual ao seu para preservar layout/ícones
+    a.innerHTML = opts.innerHTML;
+
+    a.onclick = function(e) {
+      e.preventDefault();
+      opts.onClick();
+    };
+
+    li.appendChild(a);
+    return li;
+  }
+
+  // Verifica quais features estão habilitadas (nível de conta)
+  var features = await checkEnabledFeatures();
+  console.log('[CW Menu] Features da conta:', features);
+
+  // Verifica permissões do usuário (nível de usuário)
+  var permissions = await checkUserPermissions();
+  console.log('[CW Menu] Permissões do usuário:', permissions);
+
+  // Menu Kanban (se feature habilitada E usuário tem permissão)
+  if (features.kanbanEnabled && permissions.kanbanAccess) {
+    var kanbanLi = createCustomMenuLi({
+      id: 'cw-custom-menu-kanban',
+      innerHTML:
+        '<div class="relative flex items-center gap-2"><div class="flex items-center gap-1.5 flex-grow min-w-0">' +
+        '<span class="menu-icon"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="9" y1="3" x2="9" y2="21"></line><line x1="15" y1="3" x2="15" y2="21"></line>' +
+        '</svg></span><span class="text-sm font-medium leading-5 truncate">Kanban</span></div></div>',
+      onClick: function() { window.cwCustomToggleKanban(); }
+    });
+
+    mainNav.insertBefore(kanbanLi, refLi);
+    console.log('[CW Menu] Menu Kanban adicionado');
+  } else {
+    console.log('[CW Menu] Menu Kanban NÃO adicionado (desabilitado)');
+  }
+
+  // Menu Conexões (se feature habilitada E usuário tem permissão)
+  if (features.conexoesEnabled && permissions.conexoesAccess) {
+    var conexoesLi = createCustomMenuLi({
+      id: 'cw-custom-menu-conexoes',
+      innerHTML:
+        '<div class="relative flex items-center gap-2"><div class="flex items-center gap-1.5 flex-grow min-w-0">' +
+        '<span class="menu-icon"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>' +
+        '</svg></span><span class="text-sm font-medium leading-5 truncate">Conexões</span></div></div>',
+      onClick: function() { window.cwCustomToggleConexoes(); }
+    });
+
+    mainNav.insertBefore(conexoesLi, refLi);
+    console.log('[CW Menu] Menu Conexões adicionado');
+  } else {
+    console.log('[CW Menu] Menu Conexões NÃO adicionado (desabilitado)');
+  }
+
+  // Menu Chats Internos (se feature habilitada E usuário tem permissão)
+  if (features.chatsInternosEnabled && permissions.chatsInternosAccess) {
+    var chatsLi = createCustomMenuLi({
+      id: 'cw-custom-menu-chats',
+      innerHTML:
+        '<div class="relative flex items-center gap-2"><div class="flex items-center gap-1.5 flex-grow min-w-0">' +
+        '<span class="menu-icon"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path>' +
+        '</svg></span><span class="text-sm font-medium leading-5 truncate">Chats Internos</span></div></div>',
+      onClick: function() { window.cwCustomToggleChats(); }
+    });
+
+    mainNav.insertBefore(chatsLi, refLi);
+    console.log('[CW Menu] Menu Chats Internos adicionado');
+  } else {
+    console.log('[CW Menu] Menu Chats Internos NÃO adicionado (desabilitado)');
+  }
+
+  // Menu Projetos (se feature habilitada E usuário tem permissão)
+  if (features.projectsEnabled && permissions.projectsAccess) {
+    var projetosLi = createCustomMenuLi({
+      id: 'cw-custom-menu-projetos',
+      innerHTML:
+        '<div class="relative flex items-center gap-2"><div class="flex items-center gap-1.5 flex-grow min-w-0">' +
+        '<span class="menu-icon"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<path d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path>' +
+        '</svg></span><span class="text-sm font-medium leading-5 truncate">Projetos</span></div></div>',
+      onClick: function() { window.cwCustomToggleProjetos(); }
+    });
+
+    mainNav.insertBefore(projetosLi, refLi);
+    console.log('[CW Menu] Menu Projetos adicionado');
+  } else {
+    console.log('[CW Menu] Menu Projetos NÃO adicionado (feature:', features.projectsEnabled, ', permissão:', permissions.projectsAccess, ')');
+  }
+
+  // Botão Permissões Extras na página de Funções Personalizadas
+  var isAccountAdmin = await checkIfAccountAdmin();
+  if (isAccountAdmin || permissions.permissoesAccess) {
+    console.log('[CW Menu] Configurando botão Permissões Extras na página de Funções Personalizadas');
+
+    function addPermissoesButton() {
+      if (document.getElementById('cw-custom-permissoes-button')) return;
+
+      var buttons = document.querySelectorAll('button');
+      var addRoleButton = null;
+
+      for (var i = 0; i < buttons.length; i++) {
+        var text = (buttons[i].textContent || '').toLowerCase();
+        if (text.includes('adicionar função personalizada') || text.includes('add custom role')) {
+          addRoleButton = buttons[i];
+          break;
+        }
+      }
+
+      if (addRoleButton && addRoleButton.parentElement) {
+        console.log('[CW Menu] Botão de adicionar função encontrado, criando botão Permissões Extras');
+
+        var permissoesButton = document.createElement('button');
+        permissoesButton.id = 'cw-custom-permissoes-button';
+        permissoesButton.className = addRoleButton.className;
+        permissoesButton.type = 'button';
+        permissoesButton.style.marginLeft = '8px';
+
+        permissoesButton.innerHTML =
+          '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 6px;">' +
+          '<circle cx="12" cy="12" r="3"></circle>' +
+          '<path d="M12 1v6m0 6v6m5.657-11.657l-4.243 4.243m0 6l-4.243 4.243M1 12h6m6 0h6m-1.343-5.657l-4.243 4.243m0 6l-4.243 4.243"></path>' +
+          '</svg><span>Permissões Extras</span>';
+
+        permissoesButton.onclick = function(e) {
+          e.preventDefault();
+          window.cwCustomTogglePermissoes();
+        };
+
+        addRoleButton.parentElement.appendChild(permissoesButton);
+        console.log('[CW Menu] Botão Permissões Extras adicionado');
+      }
+    }
+
+    var pageObserver = new MutationObserver(function() {
+      var path = window.location.pathname;
+      if (path.includes('custom_role') || path.includes('custom-role')) {
+        addPermissoesButton();
+      }
+    });
+
+    pageObserver.observe(document.body, { childList: true, subtree: true });
+
+    setTimeout(addPermissoesButton, 1000);
+  }
+
+  // Menu Chatbot Flows (se feature habilitada E usuário tem permissão)
+  if (features.chatbotFlowsEnabled && permissions.chatbotFlowsAccess) {
+    var chatbotLi = createCustomMenuLi({
+      id: 'cw-custom-menu-chatbot',
+      innerHTML:
+        '<div class="relative flex items-center gap-2"><div class="flex items-center gap-1.5 flex-grow min-w-0">' +
+        '<span class="menu-icon"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 640 512" fill="currentColor">' +
+        '<path d="M128 32C92.7 32 64 60.7 64 96v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V96c0-35.3-28.7-64-64-64H128zM512 96c0 53-43 96-96 96H346.5l-45.3 128H384c53 0 96 43 96 96s-43 96-96 96H256c-53 0-96-43-96-96s43-96 96-96h82.5l45.3-128H256c-53 0-96-43-96-96V96c0-53 43-96 96-96H384c53 0 96 43 96 96V96zM384 352H256c-26.5 0-48 21.5-48 48s21.5 48 48 48H384c26.5 0 48-21.5 48-48s-21.5-48-48-48z"/>' +
+        '</svg></span><span class="text-sm font-medium leading-5 truncate">Chatbot Flows</span></div></div>',
+      onClick: function() { window.cwCustomToggleChatbot(); }
+    });
+
+    mainNav.insertBefore(chatbotLi, refLi);
+    console.log('[CW Menu] Menu Chatbot Flows adicionado');
+  } else {
+    console.log('[CW Menu] Menu Chatbot Flows NÃO adicionado (feature:', features.chatbotFlowsEnabled, ', permissão:', permissions.chatbotFlowsAccess, ')');
+  }
+
+  // Menu Config Extra (apenas para SuperAdmin)
+  var isSuperAdmin = await checkIfSuperAdmin();
+  if (isSuperAdmin && configLi) {
+    console.log('[CW Menu] Usuário é SuperAdmin, adicionando menu Config Extra');
+
+    var permissionsLi = document.createElement('li');
+    permissionsLi.className = refLi.className;
+
+    var permissionsItem = document.createElement('a');
+    permissionsItem.id = 'cw-custom-menu-permissions';
+    permissionsItem.className = refLink.className;
+    permissionsItem.href = '#';
+    permissionsItem.style.cursor = 'pointer';
+    permissionsItem.innerHTML =
+      '<div class="relative flex items-center gap-2"><div class="flex items-center gap-1.5 flex-grow min-w-0">' +
+      '<span class="menu-icon"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+      '<rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path>' +
+      '</svg></span><span class="text-sm font-medium leading-5 truncate">Config Extra</span></div></div>';
+
+    permissionsItem.onclick = function(e) { e.preventDefault(); window.cwCustomTogglePermissions(); };
+
+    permissionsLi.appendChild(permissionsItem);
+
+    // Insere após o item de Configurações
+    if (configLi.nextSibling) {
+      mainNav.insertBefore(permissionsLi, configLi.nextSibling);
+    } else {
+      mainNav.appendChild(permissionsLi);
+    }
+  }
+
+  menuItemsAdded = true;
+  if (observer) { observer.disconnect(); observer = null; }
+  console.log('[CW Menu] Adição de menus concluída!');
+  return true;
+}
+
+  // ============================================================
+  // BOTÃO NA PÁGINA DE RELATÓRIOS
+  // ============================================================
+  var reportsButtonAdded = false;
+
+  function addReportsButton() {
+    console.log('[CW Reports Button] ===== Executando =====');
+    console.log('[CW Reports Button] URL atual:', location.href);
+
+    // Verifica se está EXATAMENTE na página /reports/overview (não outras páginas de relatórios)
+    if (!location.href.includes('/reports/overview')) {
+      console.log('[CW Reports Button] Não está em /reports/overview');
+      // Remove o botão se estiver em outra página
+      var existingBtn = document.getElementById('cw-projects-report-btn-container');
+      if (existingBtn) {
+        existingBtn.remove();
+        console.log('[CW Reports Button] Botão removido (página errada)');
+      }
+      reportsButtonAdded = false;
+      return;
+    }
+
+    console.log('[CW Reports Button] ✓ Está em /reports/overview');
+
+    // Evita adicionar múltiplas vezes
+    if (document.getElementById('cw-projects-report-btn-container')) {
+      console.log('[CW Reports Button] Botão já existe, pulando');
+      return;
+    }
+
+    // Procura pela div que contém o título "Visão geral" dentro da área de conteúdo principal
+    var targetElement = null;
+
+    console.log('[CW Reports Button] Procurando container correto...');
+
+    // Tenta encontrar o container com classe específica primeiro
+    var possibleContainers = document.querySelectorAll('div.flex.items-center.justify-between, div[class*="flex"][class*="justify-between"]');
+
+    console.log('[CW Reports Button] Containers encontrados:', possibleContainers.length);
+
+    for (var i = 0; i < possibleContainers.length; i++) {
+      var container = possibleContainers[i];
+      var textContent = container.textContent || '';
+
+      console.log('[CW Reports Button] Container #' + i + ':', textContent.substring(0, 100));
+
+      // Verifica se contém "Visão geral" (ou "Overview" como alternativa)
+      if (textContent.includes('Visão geral') || textContent.includes('Overview')) {
+        // Verifica se NÃO está dentro do menu lateral (sidebar)
+        var isInSidebar = false;
+        var parent = container.parentElement;
+        while (parent) {
+          if (parent.tagName === 'ASIDE' || (parent.className && typeof parent.className === 'string' && parent.className.includes('sidebar'))) {
+            isInSidebar = true;
+            console.log('[CW Reports Button] Container está no sidebar, pulando');
+            break;
+          }
+          parent = parent.parentElement;
+        }
+
+        if (!isInSidebar) {
+          targetElement = container;
+          console.log('[CW Reports Button] ✓ Container correto encontrado (não está no sidebar)');
+          break;
+        }
+      }
+    }
+
+    if (!targetElement) {
+      console.log('[CW Reports Button] ✗ Container não encontrado, tentando novamente em 2s...');
+      setTimeout(addReportsButton, 2000);
+      return;
+    }
+
+    console.log('[CW Reports Button] ✓ Target element:', targetElement.tagName, targetElement.className);
+
+    // Configura o container para usar flexbox
+    targetElement.style.display = 'flex';
+    targetElement.style.justifyContent = 'space-between';
+    targetElement.style.alignItems = 'center';
+
+    // Cria o botão
+    var button = document.createElement('button');
+    button.id = 'cw-projects-report-btn-container';
+    button.style.cssText = 'background: #1f93ff; color: white; border: none; padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; border-radius: 6px; box-shadow: 0 2px 6px rgba(31, 147, 255, 0.3); transition: all 0.2s ease; display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0;';
+
+    button.innerHTML = '<svg style="width: 16px; height: 16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg><span>Relatórios Extras</span>';
+
+    button.onmouseover = function() {
+      this.style.background = '#0d7ce6';
+      this.style.transform = 'translateY(-1px)';
+      this.style.boxShadow = '0 4px 10px rgba(31, 147, 255, 0.4)';
+    };
+
+    button.onmouseout = function() {
+      this.style.background = '#1f93ff';
+      this.style.transform = 'translateY(0)';
+      this.style.boxShadow = '0 2px 6px rgba(31, 147, 255, 0.3)';
+    };
+
+    button.onclick = function() {
+      console.log('[CW Reports Button] Botão clicado! Abrindo relatórios de projetos...');
+      window.cwCustomOpen('/projects-reports');
+    };
+
+    // Adiciona o botão ao elemento alvo
+    targetElement.appendChild(button);
+
+    reportsButtonAdded = true;
+    console.log('[CW Reports Button] ✅ Botão adicionado com sucesso!');
+  }
+
+  function monitorReportsPage() {
+    // Tenta adicionar o botão inicialmente
+    addReportsButton();
+
+    // Monitora mudanças de URL
+    var lastReportsUrl = location.href;
+    setInterval(function() {
+      if (location.href !== lastReportsUrl) {
+        lastReportsUrl = location.href;
+        setTimeout(addReportsButton, 500);
+      }
+    }, 500);
+
+    // Observador de mutações para detectar quando o conteúdo carrega
+    // IMPORTANTE: Só adiciona o botão se ainda não existe para evitar loop infinito
+    var reportsObserver = new MutationObserver(function() {
+      if (location.href.includes('/reports/overview') && !document.getElementById('cw-projects-report-btn-container')) {
+        addReportsButton();
+      }
+    });
+
+    reportsObserver.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+  }
+
+  function initMenu() {
+    injectCSS();
+    createPanel();
+    setupNavigationDetection();
+    monitorReportsPage(); // Inicia monitoramento da página de relatórios
+    var attempts = 0;
+    var maxAttempts = 30;
+    function tryAdd() {
+      if (menuItemsAdded) return;
+      if (addMenuItems()) return;
+      attempts++;
+      if (attempts < maxAttempts) setTimeout(tryAdd, 500);
+    }
+    setTimeout(tryAdd, 1500);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initMenu);
+  } else {
+    initMenu();
+  }
+})();
